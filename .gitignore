@@ -1,0 +1,47 @@
+# Python-specific ignores
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.pkl
+*.log
+
+# Virtual environment (if you are using one)
+venv/
+env/
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Model checkpoints and outputs
+checkpoint/
+pytorch_model.bin
+*.ckpt
+runs/
+
+# Hugging Face datasets and cache
+.cache/
+datasets/
+*.dataset_cache
+*.lock
+
+# Large data or model files
+*.h5
+*.onnx
+*.tflite
+*.pt
+
+# Tokenizer and config files
+*.json
+*.txt
+tokenizer_config.json
+vocab.txt
+
+# Machine learning experiment tracking (if using tools like TensorBoard or Weights & Biases)
+logs/
+wandb/
+*.tensorboard
+events.out.tfevents.*
+
+# Ignore Hugging Face Trainer's log files
+output_dir/ 
