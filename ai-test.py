@@ -1,6 +1,5 @@
 import torch
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, DataCollatorWithPadding, Trainer, TrainingArguments
-from huggingface_hub import login
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, DataCollatorWithPadding, Trainer, TrainingArguments, AutoModelForTokenClassification
 from datasets import load_dataset
 import numpy as np
 import evaluate
@@ -144,14 +143,64 @@ def TestFineTuneBERT():
         compute_metrics=compute_metrics
     )
 
+def TestTokenClassification():
+    # Load the dataset
+    pii_data = load_dataset("ai4privacy/pii-masking-400k")
+
+    # Grab our tokenizer
+    def preprocess_data(example):
+        # Convert mbert_tokens and mbert_token_classes to the required format
+        example['input_ids'] = example['mbert_tokens']  # Assume mbert_tokens is already token IDs
+        example['labels'] = example['mbert_token_classes']  # Use mbert_token_classes as labels
+        return example
+    
+    # Apply preprocessing
+    train_dataset = pii_data['train'].map(preprocess_data, remove_columns=['mbert_tokens', 'mbert_token_classes'])
+    eval_dataset = pii_data['validation'].map(preprocess_data, remove_columns=['mbert_tokens', 'mbert_token_classes'])
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForTokenClassification.from_pretrained("microsoft/mdeberta-v3-base").to(device)
+
+    training_args = TrainingArguments(
+        output_dir="./results",
+        evaluation_strategy="epoch",
+        learning_rate=2e-5,
+        per_device_train_batch_size=8,  # Adjust based on your GPU memory
+        per_device_eval_batch_size=8,
+        num_train_epochs=3,
+        weight_decay=0.01,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+    )
+
+    trainer.train()
+
+    evaluation_results = trainer.evaluate()
+    print("Evaluation Results:")
+    for key, value in evaluation_results.items():
+        print(f"{key}: {value:.4f}")
+
+def TestExistingModel():
+
+    text = "Hello, my name is Robert Herchavek and I live in New York city. 53081."
+
+    print(classifier(text))
+
 # Define a main function that serves as the entry point of the program
 def main():
 
     # See if GPU is available to use 
     device = 0 if torch.cuda.is_available() else -1
-    print(torch.cuda.is_available())
 
     # Test the different Hugging Face functions here
+    #TestTokenClassification()
+
+    TestExistingModel()
 
 
 # Ensure that the main function is called when the script is executed directly
