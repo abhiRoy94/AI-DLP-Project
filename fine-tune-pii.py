@@ -1,62 +1,82 @@
-from transformers import AutoTokenizer, AutoModelForTokenClassification, DataCollatorForTokenClassification, TrainingArguments, Trainer, AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForTokenClassification, DataCollatorForTokenClassification, TrainingArguments, Trainer, AutoTokenizer, AdamW, pipeline
 from datasets import load_dataset
 import torch
 import numpy as np
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+import evaluate
 
 # Main LLM Training function
 def FineTuneLLM():
 
     # Load the pii dataset
     pii_dataset = load_dataset("ai4privacy/pii-masking-400k")
-    print(pii_dataset.column_names["train"])
 
     # Iterate over a small sample of the dataset and grab the unique labels
     unique_labels = set()
     for example in pii_dataset['train'].select(range(100)):
         unique_labels.update(example['mbert_token_classes'])
-    #print(f"labels: {unique_labels}, length: {len(unique_labels)}")
 
     # Create label to id and id to label mappings
     unique_labels = sorted(unique_labels) # Ensure consistent ordering
     label2id = {label: i for i, label in enumerate(unique_labels)}
     id2label = {i: label for i, label in enumerate(unique_labels)}
-
+    
     # Load the tokenizer
-    model_name = "microsoft/deberta-v3-base"  
-    tokenizer = AutoTokenizer.from_pretrained('microsoft/deberta-v3-base')
+    model_name = "microsoft/deberta-v3-small"  
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # Use a data collator
-    data_collator = DataCollatorForTokenClassification(tokenizer, padding=True)
+    data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
     
-    # Prepare the dataset for training
-    def tokenize_and_label(examples):
-        # Tokenize the masked text
-        encodings = tokenizer(
-            examples['masked_text'],
-            truncation=True,
-            padding='max_length',  # or 'longest' based on your preference
-            max_length=128,  # Set to your desired max length
-            return_offsets_mapping=True,  # Useful for aligning labels
-        )
-
-        # Create labels from mbert_token_classes
+    # Prepare the dataset for training by tokenizing and align the input
+    def tokenize_and_align_labels(examples):
+        tokenized_inputs = tokenizer(examples["source_text"], truncation=True)
+        currIds = []
+        for i in range(len(examples["mbert_token_classes"])):
+            currIds.append([label2id[example] for example in examples["mbert_token_classes"][i]])
         labels = []
-        for i, label_sequence in enumerate(examples['mbert_token_classes']):
-            # Assuming label_sequence is in string format, you might need to convert them to IDs
-            # For example, if your labels are in string format, create a label mapping
-            # Example: label2id = {"LABEL_A": 0, "LABEL_B": 1, ...}
-            label = label2id[label_sequence]  # Adjust if necessary
-            labels.append(label)
+        for i, label in enumerate(currIds):
+            word_ids = tokenized_inputs.word_ids(batch_index=i)  # Map tokens to their respective word.
+            previous_word_idx = None
+            label_ids = []
+            for word_idx in word_ids:  # Set the special tokens to -100.
+                if word_idx is None:
+                    label_ids.append(-100)
+                elif word_idx != previous_word_idx:  # Only label the first token of a given word.
+                    label_ids.append(label[word_idx])
+                else:
+                    label_ids.append(-100)
+                previous_word_idx = word_idx
+            labels.append(label_ids)
 
-        # Assign the labels to the encoding
-        encodings['labels'] = labels
-        return encodings
+        tokenized_inputs["labels"] = labels
+        return tokenized_inputs
     
-    tokenized_dataset = pii_dataset.map(tokenize_and_label, batched=True)
+    tokenized_pii = pii_dataset.map(tokenize_and_align_labels, batched=True)
 
-    print(tokenized_dataset['train'][0])
+    # Compute metrics functions that will be used during training
+    seqeval = evaluate.load("seqeval")
+    def compute_metrics(p):
+        predictions, labels = p
+        predictions = np.argmax(predictions, axis=2)
 
+        true_predictions = [
+            [unique_labels[p] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions, labels)
+        ]
+        true_labels = [
+            [unique_labels[l] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions, labels)
+        ]
+
+        results = seqeval.compute(predictions=true_predictions, references=true_labels)
+        return {
+            "precision": results["overall_precision"],
+            "recall": results["overall_recall"],
+            "f1": results["overall_f1"],
+            "accuracy": results["overall_accuracy"],
+        }
+    
+    torch.cuda.empty_cache()
     # Load the model and ensure it runs on the GPU
     model = AutoModelForTokenClassification.from_pretrained(
         model_name,
@@ -67,13 +87,14 @@ def FineTuneLLM():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    '''
+    
     training_args = TrainingArguments(
         output_dir='./results/my-pii-model',         # Output directory for model predictions and checkpoints
+        save_strategy="epoch",
         evaluation_strategy="epoch",                 # Evaluate at the end of each epoch
         learning_rate=5e-5,                          # Learning rate
-        per_device_train_batch_size=128,             # Training batch size
-        per_device_eval_batch_size=128,              # Evaluation batch size
+        per_device_train_batch_size=16,              # Training batch size
+        per_device_eval_batch_size=16,               # Evaluation batch size
         num_train_epochs=5,                          # Number of training epochs
         weight_decay=0.01,                           # Weight decay for optimizer
         logging_dir='./logs',                        # Directory for storing logs
@@ -88,52 +109,24 @@ def FineTuneLLM():
         warmup_ratio=0.05,                           # Warmup ratio for learning rate scheduler
     )
 
+    optimizer = AdamW(model.parameters(), lr=5e-5, betas=(0.9, 0.999), eps=1e-8)
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=encoded_dataset['train'],
-        eval_dataset=encoded_dataset['validation'],
+        train_dataset=tokenized_pii['train'],
+        eval_dataset=tokenized_pii['validation'],
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        optimizers=(optimizer, None)
     )
 
     trainer.train()
-    '''
 
-
-
-# Compute metrics functions that will be used during training
-def compute_metrics(pred):
-    # Extract predictions and true labels
-    predictions, labels = pred
-
-    # Get the predicted classes
-    preds = np.argmax(predictions, axis=1)
-
-    # Mask the padding tokens (usually labeled as -100)
-    mask = labels != -100  # Assuming -100 is used for padding
-    labels = labels[mask]
-    preds = preds[mask]
-
-    # Calculate metrics
-    accuracy = accuracy_score(labels, preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='weighted')
-
-    return {
-        'accuracy': accuracy,
-        'f1': f1,
-        'precision': precision,
-        'recall': recall,
-    }
-
-# Define a main function that serves as the entry point of the program
 def main():
 
-    # Fine Tune Llama 3 with sensitive datasets
+    # Fine Tune DeBertaV3 with sensitive datasets
     FineTuneLLM()
 
-
-# Ensure that the main function is called when the script is executed directly
 if __name__ == "__main__":
     main()
