@@ -1,14 +1,62 @@
 from transformers import AutoTokenizer, AutoModelForTokenClassification, DataCollatorForTokenClassification, TrainingArguments, Trainer, AutoTokenizer, AdamW, pipeline
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
+from seqeval.metrics import classification_report
 import torch
 import numpy as np
 import evaluate
+
+def generate_sequence_labels(text, privacy_mask):
+
+    # sort privacy mask by start position
+    privacy_mask = sorted(privacy_mask, key=lambda x: x['start'], reverse=True)
+    
+    # replace sensitive pieces of text with labels
+    for item in privacy_mask:
+        label = item['label']
+        start = item['start']
+        end = item['end']
+        value = item['value']
+        # count the number of words in the value
+        word_count = len(value.split())
+        
+        # replace the sensitive information with the appropriate number of [label] placeholders
+        replacement = " ".join([f"{label}" for _ in range(word_count)])
+        text = text[:start] + replacement + text[end:]
+        
+    words = text.split()
+    # assign labels to each word
+    labels = []
+    for word in words:
+        match = re.search(r"(\w+)", word)  # match any word character
+        if match:
+            label = match.group(1)
+            if label in label_set:
+                labels.append(label)
+            else:
+                # any other word is labeled as "O"
+                labels.append("O")
+        else:
+            labels.append("O")
+    return labels
+
 
 # Main LLM Training function
 def FineTuneLLM():
 
     # Load the pii dataset
     pii_dataset = load_dataset("ai4privacy/pii-masking-400k")
+
+    example = pii_dataset["train"][0]
+
+    # Test with only the first 10000 elements
+    train_subset = pii_dataset['train'].select(range(10000))
+    validation_subset = pii_dataset['validation'].select(range(10000))
+
+    # Combine the subsets into a new DatasetDict
+    pii_dataset = DatasetDict({
+        'train': train_subset,
+        'validation': validation_subset
+    })
 
     # Iterate over a small sample of the dataset and grab the unique labels
     unique_labels = set()
@@ -21,7 +69,7 @@ def FineTuneLLM():
     id2label = {i: label for i, label in enumerate(unique_labels)}
     
     # Load the tokenizer
-    model_name = "microsoft/deberta-v3-small"  
+    model_name = "distilbert/distilbert-base-multilingual-cased"  
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # Use a data collator
@@ -29,28 +77,44 @@ def FineTuneLLM():
     
     # Prepare the dataset for training by tokenizing and align the input
     def tokenize_and_align_labels(examples):
-        tokenized_inputs = tokenizer(examples["source_text"], truncation=True)
-        currIds = []
-        for i in range(len(examples["mbert_token_classes"])):
-            currIds.append([label2id[example] for example in examples["mbert_token_classes"][i]])
+        words = [t.split() for t in examples["source_text"]]
+        tokenized_inputs = tokenizer(words, truncation=True, is_split_into_words=True, max_length=512)
+        source_labels = [
+            generate_sequence_labels(text, mask)
+            for text, mask in zip(examples["source_text"], examples["privacy_mask"])
+        ]
+
         labels = []
-        for i, label in enumerate(currIds):
-            word_ids = tokenized_inputs.word_ids(batch_index=i)  # Map tokens to their respective word.
-            previous_word_idx = None
-            label_ids = []
-            for word_idx in word_ids:  # Set the special tokens to -100.
-                if word_idx is None:
-                    label_ids.append(-100)
-                elif word_idx != previous_word_idx:  # Only label the first token of a given word.
-                    label_ids.append(label[word_idx])
-                else:
-                    label_ids.append(-100)
-                previous_word_idx = word_idx
-            labels.append(label_ids)
+        valid_idx = []
+        for i, label in enumerate(source_labels):
+            word_ids = tokenized_inputs.word_ids(batch_index=i)  # map tokens to their respective word.
+            previous_label = None
+            label_ids = [-100]
+            try:
+                for word_idx in word_ids:
+                    if word_idx is None:
+                        continue
+                    elif label[word_idx] == "O":
+                        label_ids.append(label2id["O"])
+                        continue
+                    elif previous_label == label[word_idx]:
+                        label_ids.append(label2id[f"I-{label[word_idx]}"])
+                    else:
+                        label_ids.append(label2id[f"B-{label[word_idx]}"])
+                    previous_label = label[word_idx]
+                label_ids = label_ids[:511] + [-100]
+                labels.append(label_ids)
+                # print(word_ids)
+                # print(label_ids)
+            except:
+                global k
+                k += 1
+                # print(f"{word_idx = }")
+                # print(f"{len(label) = }")
+                labels.append([-100] * len(tokenized_inputs["input_ids"][i]))
 
         tokenized_inputs["labels"] = labels
         return tokenized_inputs
-    
     tokenized_pii = pii_dataset.map(tokenize_and_align_labels, batched=True)
 
     # Compute metrics functions that will be used during training
@@ -87,7 +151,6 @@ def FineTuneLLM():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    
     training_args = TrainingArguments(
         output_dir='./results/my-pii-model',         # Output directory for model predictions and checkpoints
         save_strategy="epoch",
@@ -123,10 +186,79 @@ def FineTuneLLM():
 
     trainer.train()
 
+def ComputeMetricsLLM():
+    
+    # Use the validation set to validate the effective mapping of the different categories
+    pii_dataset = load_dataset("ai4privacy/pii-masking-400k")
+    
+    # Load the fine-tuned model and tokenizer
+    folder_to_model = "results/my-pii-model"
+    model = AutoModelForTokenClassification.from_pretrained(folder_to_model)
+    tokenizer = AutoTokenizer.from_pretrained(folder_to_model)
+
+    unique_labels = list(model.config.id2label.values())
+    label2id = model.config.label2id
+    true_labels = []
+    predicted_labels = []
+
+    # Prepare the dataset for training by tokenizing and align the input
+    def tokenize_and_align_labels(examples):
+        tokenized_inputs = tokenizer(examples["source_text"], truncation=True)
+        currIds = []
+        for i in range(len(examples["mbert_token_classes"])):
+            currIds.append([label2id[example] for example in examples["mbert_token_classes"][i]])
+        labels = []
+        for i, label in enumerate(currIds):
+            word_ids = tokenized_inputs.word_ids(batch_index=i)  # Map tokens to their respective word.
+            previous_word_idx = None
+            label_ids = []
+            for word_idx in word_ids:  # Set the special tokens to -100.
+                if word_idx is None:
+                    label_ids.append(-100)
+                elif word_idx != previous_word_idx:  # Only label the first token of a given word.
+                    label_ids.append(label[word_idx])
+                else:
+                    label_ids.append(-100)
+                previous_word_idx = word_idx
+            labels.append(label_ids)
+        tokenized_inputs["labels"] = labels
+        return tokenized_inputs
+    
+    tokenized_dataset = pii_dataset['validation'].map(tokenize_and_align_labels, batched=True)
+
+    for entry in tokenized_dataset:
+        # Convert input_ids, attention_mask, and labels into tensors
+        input_ids = torch.tensor(entry["input_ids"]).unsqueeze(0)  # Add batch dimension
+        attention_mask = torch.tensor(entry["attention_mask"]).unsqueeze(0)  # Add batch dimension
+        labels = torch.tensor(entry["labels"]).unsqueeze(0)  # Add batch dimension
+
+        # Run the model to get predictions
+        outputs = model(input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        predictions = np.argmax(logits.detach().cpu().numpy(), axis=2)
+
+        # Process predictions and true labels to exclude padding tokens (labeled as -100)
+        true_label = [unique_labels[l] for l in labels[0].numpy() if l != -100]  # Get true labels excluding padding
+        prediction = [unique_labels[p] for p, l in zip(predictions[0], labels[0].numpy()) if l != -100]  # Get predictions excluding padding
+
+        true_labels.append(true_label)
+        predicted_labels.append(prediction)
+
+    # Generate the classification report
+    report = classification_report(true_labels, predicted_labels, output_dict=True)
+
+    # Display the report as a dictionary with per-category metrics
+    for category, scores in report.items():
+        print(f"{category}: Precision={scores['precision']:.2f}, Recall={scores['recall']:.2f}, F1={scores['f1-score']:.2f}")
+
 def main():
 
     # Fine Tune DeBertaV3 with sensitive datasets
-    FineTuneLLM()
+    #FineTuneLLM()
+
+    # Evaluate on all of the categories
+    #ComputeMetricsLLM()
+    
 
 if __name__ == "__main__":
     main()
