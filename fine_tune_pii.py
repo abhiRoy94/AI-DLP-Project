@@ -5,9 +5,11 @@ import torch
 import evaluate
 from seqeval.metrics import classification_report
 from seqeval.metrics import precision_score, recall_score, f1_score
-import matplotlib.pyplot as plt
+import sys
+import os
 
-#from plot_losses_callback import PlotLossesCallback
+from training_utils.plot_losses_callback import PlotLossesCallback
+#from training_utils.plot_predictions_callback import PlotPredictionsCallback
 
 # Define global variables used in separate functions
 tokenizer = AutoTokenizer.from_pretrained("distilbert/distilbert-base-multilingual-cased")
@@ -178,7 +180,7 @@ def FineTunePii():
         tokenizer=tokenizer,
         data_collator=data_collator, 
         compute_metrics=compute_metrics, 
-        #callbacks=[PlotLossesCallback()]
+        callbacks=[PlotLossesCallback()]
     )
 
     # 6. Run training script
