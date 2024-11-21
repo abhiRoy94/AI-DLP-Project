@@ -1,264 +1,195 @@
-from transformers import AutoTokenizer, AutoModelForTokenClassification, DataCollatorForTokenClassification, TrainingArguments, Trainer, AutoTokenizer, AdamW, pipeline
-from datasets import load_dataset, DatasetDict
-from seqeval.metrics import classification_report
-import torch
+from transformers import AutoTokenizer, DataCollatorForTokenClassification, AutoModelForTokenClassification, TrainingArguments, Trainer, AdamW
+from datasets import load_dataset
 import numpy as np
+import torch
 import evaluate
+from seqeval.metrics import classification_report
+from seqeval.metrics import precision_score, recall_score, f1_score
+import matplotlib.pyplot as plt
 
-def generate_sequence_labels(text, privacy_mask):
+#from plot_losses_callback import PlotLossesCallback
 
-    # sort privacy mask by start position
-    privacy_mask = sorted(privacy_mask, key=lambda x: x['start'], reverse=True)
-    
-    # replace sensitive pieces of text with labels
-    for item in privacy_mask:
-        label = item['label']
-        start = item['start']
-        end = item['end']
-        value = item['value']
-        # count the number of words in the value
-        word_count = len(value.split())
-        
-        # replace the sensitive information with the appropriate number of [label] placeholders
-        replacement = " ".join([f"{label}" for _ in range(word_count)])
-        text = text[:start] + replacement + text[end:]
-        
-    words = text.split()
-    # assign labels to each word
-    labels = []
-    for word in words:
-        match = re.search(r"(\w+)", word)  # match any word character
-        if match:
-            label = match.group(1)
-            if label in label_set:
-                labels.append(label)
-            else:
-                # any other word is labeled as "O"
-                labels.append("O")
-        else:
-            labels.append("O")
-    return labels
+# Define global variables used in separate functions
+tokenizer = AutoTokenizer.from_pretrained("distilbert/distilbert-base-multilingual-cased")
+special_token_ids = tokenizer.all_special_ids
+label2id, id2label = {}, {}
+metric = evaluate.load("seqeval")
 
+def compute_metrics(eval_preds):
+    logits, labels = eval_preds
+    predictions = np.argmax(logits, axis=-1)
 
-# Main LLM Training function
-def FineTuneLLM():
+    # Remove ignored index (special tokens) and convert to labels
+    true_labels = [[id2label[l] for l in label if l != -100] for label in labels]
+    true_predictions = [
+        [id2label[p] for (p, l) in zip(prediction, label) if l != -100]
+        for prediction, label in zip(predictions, labels)
+    ]
 
-    # Load the pii dataset
-    pii_dataset = load_dataset("ai4privacy/pii-masking-400k")
+    # Calculate overall metrics
+    overall_precision = precision_score(true_labels, true_predictions)
+    overall_recall = recall_score(true_labels, true_predictions)
+    overall_f1 = f1_score(true_labels, true_predictions)
 
-    example = pii_dataset["train"][0]
+    # Per-category metrics using classification_report
+    report = classification_report(true_labels, true_predictions, output_dict=True)
 
-    # Test with only the first 10000 elements
-    train_subset = pii_dataset['train'].select(range(10000))
-    validation_subset = pii_dataset['validation'].select(range(10000))
-
-    # Combine the subsets into a new DatasetDict
-    pii_dataset = DatasetDict({
-        'train': train_subset,
-        'validation': validation_subset
-    })
-
-    # Iterate over a small sample of the dataset and grab the unique labels
-    unique_labels = set()
-    for example in pii_dataset['train'].select(range(100)):
-        unique_labels.update(example['mbert_token_classes'])
-
-    # Create label to id and id to label mappings
-    unique_labels = sorted(unique_labels) # Ensure consistent ordering
-    label2id = {label: i for i, label in enumerate(unique_labels)}
-    id2label = {i: label for i, label in enumerate(unique_labels)}
-    
-    # Load the tokenizer
-    model_name = "distilbert/distilbert-base-multilingual-cased"  
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    # Use a data collator
-    data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
-    
-    # Prepare the dataset for training by tokenizing and align the input
-    def tokenize_and_align_labels(examples):
-        words = [t.split() for t in examples["source_text"]]
-        tokenized_inputs = tokenizer(words, truncation=True, is_split_into_words=True, max_length=512)
-        source_labels = [
-            generate_sequence_labels(text, mask)
-            for text, mask in zip(examples["source_text"], examples["privacy_mask"])
-        ]
-
-        labels = []
-        valid_idx = []
-        for i, label in enumerate(source_labels):
-            word_ids = tokenized_inputs.word_ids(batch_index=i)  # map tokens to their respective word.
-            previous_label = None
-            label_ids = [-100]
-            try:
-                for word_idx in word_ids:
-                    if word_idx is None:
-                        continue
-                    elif label[word_idx] == "O":
-                        label_ids.append(label2id["O"])
-                        continue
-                    elif previous_label == label[word_idx]:
-                        label_ids.append(label2id[f"I-{label[word_idx]}"])
-                    else:
-                        label_ids.append(label2id[f"B-{label[word_idx]}"])
-                    previous_label = label[word_idx]
-                label_ids = label_ids[:511] + [-100]
-                labels.append(label_ids)
-                # print(word_ids)
-                # print(label_ids)
-            except:
-                global k
-                k += 1
-                # print(f"{word_idx = }")
-                # print(f"{len(label) = }")
-                labels.append([-100] * len(tokenized_inputs["input_ids"][i]))
-
-        tokenized_inputs["labels"] = labels
-        return tokenized_inputs
-    tokenized_pii = pii_dataset.map(tokenize_and_align_labels, batched=True)
-
-    # Compute metrics functions that will be used during training
-    seqeval = evaluate.load("seqeval")
-    def compute_metrics(p):
-        predictions, labels = p
-        predictions = np.argmax(predictions, axis=2)
-
-        true_predictions = [
-            [unique_labels[p] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
-        true_labels = [
-            [unique_labels[l] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
-
-        results = seqeval.compute(predictions=true_predictions, references=true_labels)
-        return {
-            "precision": results["overall_precision"],
-            "recall": results["overall_recall"],
-            "f1": results["overall_f1"],
-            "accuracy": results["overall_accuracy"],
+    # Extract per-category metrics
+    category_metrics = {
+        category: {
+            "precision": report[category]["precision"],
+            "recall": report[category]["recall"],
+            "f1": report[category]["f1-score"]
         }
+        for category in report if category not in {"accuracy", "macro avg", "weighted avg"}
+    }
+
+    # Combine all metrics
+    metrics = {
+        "overall_precision": overall_precision,
+        "overall_recall": overall_recall,
+        "overall_f1": overall_f1,
+        "per_category": category_metrics
+    }
+
+    return metrics
+
+def split_dataset(dataset):
+    new_dataset = dataset["train"].train_test_split(train_size=0.8, seed=42)
+    new_dataset["validation"] = dataset['validation']
+    new_dataset["test"] = new_dataset.pop("test")
+    return new_dataset
+
+def align_labels_with_tokens(token_labels):
+    id_labels = []
+    for token in token_labels:
+        if token == None:
+            id_labels.append(-100)
+        else:
+            id_labels.append(label2id[token])
+
+    return id_labels
+
+def tokenize_and_align_labels(example):
     
-    torch.cuda.empty_cache()
-    # Load the model and ensure it runs on the GPU
+    # Tokenize the input and keep track of the original offset indices
+    tokenized_output = tokenizer(example['source_text'], return_offsets_mapping=True, truncation=True)
+    tokens = tokenized_output['input_ids']
+    offsets = tokenized_output["offset_mapping"]
+
+    # Run through the privacy mask and map each mask to the new tokenized data. Sort the privacy mask to save time. O(nlog(n)) < O(n^2)
+    privacy_masks = example['privacy_mask']
+    
+    total_labels = []
+    for i, privacy_mask in enumerate(privacy_masks):
+        privacy_mask = sorted(privacy_mask, key=lambda x: x['start'])
+        priv_ind = 0
+        token_labels = ["O"] * len(tokens[i])
+        for j, (start_ind, end_ind) in enumerate(offsets[i]):
+            # Check if we're dealing with a special token
+            if tokens[i][j] in special_token_ids:
+                token_labels[j] = None
+                continue
+
+            # We've gone beyond our privacy mask array, so everything else will not be sensitive data
+            if (priv_ind) >= len(privacy_mask):
+                continue
+                
+            token_start, token_end = privacy_mask[priv_ind]['start'], privacy_mask[priv_ind]['end']
+            token_label = privacy_mask[priv_ind]['label']
+
+            # The current token is part of what our privacy mask detects is sensitive
+            if (start_ind >= token_start and end_ind <= token_end):
+                token_labels[j] = f"B-{token_label}" if token_start == start_ind else f"I-{token_label}"
+
+            # Move our privacy index up if our end index is greater than the privacy start index of where we are in our list
+            if end_ind > token_end:
+                priv_ind += 1
+
+        # Convert the labels to ids
+        id_labels = align_labels_with_tokens(token_labels)
+        total_labels.append(id_labels)
+
+    del tokenized_output['offset_mapping']
+    tokenized_output["labels"] = total_labels
+    return tokenized_output
+
+def create_label_id_mapping(sample):
+    # Grab the unique labels with a set from the given token classes column
+    unique_labels = set()
+    for tokens in sample['mbert_token_classes']:
+        for token in tokens:
+            unique_labels.add(token)
+
+    # Split the unique labels into label2id and id2label
+    unique_labels = sorted(unique_labels)
+    for idx, label in enumerate(unique_labels):
+        label2id[label] = idx
+        id2label[idx] = label
+
+def FineTunePii():
+    
+    # 1. Gather the dataset and split it into 'train', 'validation' and 'test'
+    dataset = load_dataset("ai4privacy/pii-masking-400k")
+    new_pii_dataset = split_dataset(dataset)
+
+    # 2. Create id2Label and label2Id Mapping with a small subset of the dataset
+    create_label_id_mapping(new_pii_dataset["train"].select(range(1000)))
+
+    # 3. Gather a tokenized and alligned dataset that contains the tokens given to the model, and the associated labels
+    tokenized_datasets = new_pii_dataset.map(tokenize_and_align_labels, batched=True, remove_columns=new_pii_dataset["train"].column_names)
+
+    # 4. Setup a data collator to make batching and padding simple
+    data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
+
+    # 5. Set up the training arguments and environment
     model = AutoModelForTokenClassification.from_pretrained(
-        model_name,
-        num_labels=len(unique_labels),
-        label2id=label2id,
-        id2label=id2label
-    )
+        "distilbert/distilbert-base-multilingual-cased",
+        id2label=id2label,
+        label2id=label2id)
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
     training_args = TrainingArguments(
-        output_dir='./results/my-pii-model',         # Output directory for model predictions and checkpoints
-        save_strategy="epoch",
-        evaluation_strategy="epoch",                 # Evaluate at the end of each epoch
-        learning_rate=5e-5,                          # Learning rate
-        per_device_train_batch_size=16,              # Training batch size
-        per_device_eval_batch_size=16,               # Evaluation batch size
-        num_train_epochs=5,                          # Number of training epochs
-        weight_decay=0.01,                           # Weight decay for optimizer
-        logging_dir='./logs',                        # Directory for storing logs
-        logging_steps=10,                            # Log every 10 steps
-        seed=42,                                     # Seed for reproducibility
-        fp16=True,                                   # Enable mixed precision training (Native AMP)
-        optim="adamw_torch",                         # Use AdamW optimizer with PyTorch defaults
-        adam_beta1=0.9,                              # First beta for Adam optimizer
-        adam_beta2=0.999,                            # Second beta for Adam optimizer
-        adam_epsilon=1e-8,                           # Epsilon for Adam optimizer
-        lr_scheduler_type="linear",                  # Learning rate scheduler type
-        warmup_ratio=0.05,                           # Warmup ratio for learning rate scheduler
+        output_dir="./test_training/",
+        learning_rate=5e-5,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        num_train_epochs=2,  # Shortened for testing
+        evaluation_strategy="steps",
+        eval_steps=100,  # Frequent evaluation
+        save_strategy="no",  # Skip saving to speed up testing
+        logging_steps=50,
+        warmup_steps=10,
+        fp16=True,
+        seed=42
     )
 
-    optimizer = AdamW(model.parameters(), lr=5e-5, betas=(0.9, 0.999), eps=1e-8)
+    # Take a subset of the dataset
+    small_train_dataset = tokenized_datasets["train"].select(range(5000))
+    small_eval_dataset = tokenized_datasets["validation"].select(range(200))
+
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_pii['train'],
-        eval_dataset=tokenized_pii['validation'],
+        train_dataset=small_train_dataset,
+        eval_dataset=small_eval_dataset,
         tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-        optimizers=(optimizer, None)
+        data_collator=data_collator, 
+        compute_metrics=compute_metrics, 
+        #callbacks=[PlotLossesCallback()]
     )
 
+    # 6. Run training script
     trainer.train()
 
-def ComputeMetricsLLM():
-    
-    # Use the validation set to validate the effective mapping of the different categories
-    pii_dataset = load_dataset("ai4privacy/pii-masking-400k")
-    
-    # Load the fine-tuned model and tokenizer
-    folder_to_model = "results/my-pii-model"
-    model = AutoModelForTokenClassification.from_pretrained(folder_to_model)
-    tokenizer = AutoTokenizer.from_pretrained(folder_to_model)
-
-    unique_labels = list(model.config.id2label.values())
-    label2id = model.config.label2id
-    true_labels = []
-    predicted_labels = []
-
-    # Prepare the dataset for training by tokenizing and align the input
-    def tokenize_and_align_labels(examples):
-        tokenized_inputs = tokenizer(examples["source_text"], truncation=True)
-        currIds = []
-        for i in range(len(examples["mbert_token_classes"])):
-            currIds.append([label2id[example] for example in examples["mbert_token_classes"][i]])
-        labels = []
-        for i, label in enumerate(currIds):
-            word_ids = tokenized_inputs.word_ids(batch_index=i)  # Map tokens to their respective word.
-            previous_word_idx = None
-            label_ids = []
-            for word_idx in word_ids:  # Set the special tokens to -100.
-                if word_idx is None:
-                    label_ids.append(-100)
-                elif word_idx != previous_word_idx:  # Only label the first token of a given word.
-                    label_ids.append(label[word_idx])
-                else:
-                    label_ids.append(-100)
-                previous_word_idx = word_idx
-            labels.append(label_ids)
-        tokenized_inputs["labels"] = labels
-        return tokenized_inputs
-    
-    tokenized_dataset = pii_dataset['validation'].map(tokenize_and_align_labels, batched=True)
-
-    for entry in tokenized_dataset:
-        # Convert input_ids, attention_mask, and labels into tensors
-        input_ids = torch.tensor(entry["input_ids"]).unsqueeze(0)  # Add batch dimension
-        attention_mask = torch.tensor(entry["attention_mask"]).unsqueeze(0)  # Add batch dimension
-        labels = torch.tensor(entry["labels"]).unsqueeze(0)  # Add batch dimension
-
-        # Run the model to get predictions
-        outputs = model(input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
-        predictions = np.argmax(logits.detach().cpu().numpy(), axis=2)
-
-        # Process predictions and true labels to exclude padding tokens (labeled as -100)
-        true_label = [unique_labels[l] for l in labels[0].numpy() if l != -100]  # Get true labels excluding padding
-        prediction = [unique_labels[p] for p, l in zip(predictions[0], labels[0].numpy()) if l != -100]  # Get predictions excluding padding
-
-        true_labels.append(true_label)
-        predicted_labels.append(prediction)
-
-    # Generate the classification report
-    report = classification_report(true_labels, predicted_labels, output_dict=True)
-
-    # Display the report as a dictionary with per-category metrics
-    for category, scores in report.items():
-        print(f"{category}: Precision={scores['precision']:.2f}, Recall={scores['recall']:.2f}, F1={scores['f1-score']:.2f}")
 
 def main():
 
-    # Fine Tune DeBertaV3 with sensitive datasets
-    #FineTuneLLM()
+    # Call the main fine tuning function
+    FineTunePii()
 
-    # Evaluate on all of the categories
-    #ComputeMetricsLLM()
-    
 
 if __name__ == "__main__":
     main()
