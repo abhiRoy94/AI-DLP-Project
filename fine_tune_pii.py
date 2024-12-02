@@ -1,5 +1,5 @@
 from transformers import AutoTokenizer, DataCollatorForTokenClassification, AutoModelForTokenClassification, TrainingArguments, Trainer, AdamW
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 import numpy as np
 import torch
 import evaluate
@@ -9,7 +9,7 @@ import sys
 import os
 
 from training_utils.plot_losses_callback import PlotLossesCallback
-#from training_utils.plot_predictions_callback import PlotPredictionsCallback
+from training_utils.plot_predictions_callback import PlotPredictionsCallback
 
 # Define global variables used in separate functions
 tokenizer = AutoTokenizer.from_pretrained("distilbert/distilbert-base-multilingual-cased")
@@ -17,7 +17,7 @@ special_token_ids = tokenizer.all_special_ids
 label2id, id2label = {}, {}
 metric = evaluate.load("seqeval")
 
-def compute_metrics(eval_preds):
+def compute_metrics(eval_preds, id2label):
     logits, labels = eval_preds
     predictions = np.argmax(logits, axis=-1)
 
@@ -56,11 +56,32 @@ def compute_metrics(eval_preds):
 
     return metrics
 
+def create_small_subset(dataset, train_size=5000, val_size=1000):
+    small_train = dataset["train"].select(range(train_size))
+    small_val = dataset["validation"].select(range(val_size))
+
+    dataset_dict = DatasetDict({
+        "train": small_train,
+        "validation": small_val
+    })
+        
+    return dataset_dict
+
 def split_dataset(dataset):
-    new_dataset = dataset["train"].train_test_split(train_size=0.8, seed=42)
-    new_dataset["validation"] = dataset['validation']
-    new_dataset["test"] = new_dataset.pop("test")
-    return new_dataset
+    # Split the original dataset into 80% train and 20% test
+    split_data = dataset["train"].train_test_split(train_size=0.8, seed=42)
+    
+    # Split the 20% test data into 50% validation and 50% test (i.e., 10% of the original data for each)
+    validation_split = split_data["test"].train_test_split(train_size=0.5, seed=42)
+
+    # If the dataset already contains a validation split, use it as is
+    dataset_dict = DatasetDict({
+        "train": split_data["train"],         # 80% of the original data for training
+        "validation": dataset["validation"],  # Keep the existing validation split
+        "test": validation_split["test"]      # 10% of the original data for testing
+    })
+        
+    return dataset_dict
 
 def align_labels_with_tokens(token_labels):
     id_labels = []
@@ -131,9 +152,10 @@ def create_label_id_mapping(sample):
 
 def FineTunePii():
     
-    # 1. Gather the dataset and split it into 'train', 'validation' and 'test'
+    # 1. Gather the dataset
     dataset = load_dataset("ai4privacy/pii-masking-400k")
-    new_pii_dataset = split_dataset(dataset)
+    #new_pii_dataset = split_dataset(dataset) # Use this if we're planning on splitting the dataset into a train, validation, test split
+    new_pii_dataset = dataset
 
     # 2. Create id2Label and label2Id Mapping with a small subset of the dataset
     create_label_id_mapping(new_pii_dataset["train"].select(range(1000)))
@@ -154,33 +176,45 @@ def FineTunePii():
     model.to(device)
 
     training_args = TrainingArguments(
-        output_dir="./test_training/",
-        learning_rate=5e-5,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        num_train_epochs=2,  # Shortened for testing
-        evaluation_strategy="steps",
-        eval_steps=100,  # Frequent evaluation
-        save_strategy="no",  # Skip saving to speed up testing
-        logging_steps=50,
-        warmup_steps=10,
-        fp16=True,
-        seed=42
+        output_dir='./results/my_pii_model',            # Directory to save the model checkpoints
+        evaluation_strategy="epoch",                    # Evaluate every 'eval_steps' epochs
+        save_strategy="epoch",                          # Save checkpoint every 'save_steps'
+        logging_dir='./logs',                           # Directory for log files
+        logging_steps=500,                              # Log training progress every 500 steps
+        save_steps=1000,                                # Save a checkpoint every 1000 steps
+        eval_steps=1000,                                # Run evaluation every 1000 steps
+        per_device_train_batch_size=8,                  # Batch size for training on each device
+        per_device_eval_batch_size=8,                   # Batch size for evaluation
+        gradient_accumulation_steps=2,                  # Accumulate gradients over multiple steps before updating weights
+        num_train_epochs=5,                             # Number of training epochs
+        weight_decay=0.01,                              # Regularization (L2 weight decay)
+        learning_rate=2e-5,                             # Learning rate for the optimizer
+        warmup_steps=500,                               # Number of warmup steps for learning rate scheduler
+        logging_first_step=True,                        # Log the first training step
+        load_best_model_at_end=True,                    # Load the best model based on evaluation metric at the end of training
+        metric_for_best_model="eval_loss",              # Use validation loss to identify the best model
+        disable_tqdm=False,                             # Enable progress bars
+        fp16=True,                                      # Use mixed precision for faster training (requires GPU with FP16 support)
+        dataloader_num_workers=4,                       # Number of subprocesses to use for data loading
+        run_name="fine_tuning_pii",                     # Name of the run for tracking purposes
+        seed=42,                                        # Random seed for reproducibility
+        push_to_hub=True,                               # Push model to Hugging Face Hub
+        hub_model_id="AyyRoy/my-pii-model",             # Specify your model repo name
+        hub_strategy="every_save",                      # Push to the hub every time the model is saved
     )
 
-    # Take a subset of the dataset
-    small_train_dataset = tokenized_datasets["train"].select(range(5000))
-    small_eval_dataset = tokenized_datasets["validation"].select(range(200))
+    # Optional: Setup callbacks to measure metrics during training phase
+    #plot_losses_callback = PlotLossesCallback()
+    #plot_predictions_callback = PlotPredictionsCallback()
 
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=small_train_dataset,
-        eval_dataset=small_eval_dataset,
+        train_dataset=tokenized_datasets['train'],
+        eval_dataset=tokenized_datasets['validation'],
         tokenizer=tokenizer,
         data_collator=data_collator, 
-        compute_metrics=compute_metrics, 
-        callbacks=[PlotLossesCallback()]
+        compute_metrics=lambda eval_preds: compute_metrics(eval_preds, id2label)
     )
 
     # 6. Run training script

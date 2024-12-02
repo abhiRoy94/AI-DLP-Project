@@ -1,50 +1,61 @@
-import torch
+import matplotlib
+matplotlib.use('TkAgg')  # Use the TkAgg backend, which supports interactive features
 import matplotlib.pyplot as plt
-from sklearn.metrics import classification_report
-from transformers import TrainerCallback, TrainingArguments, Trainer
-from transformers import AutoTokenizer, AutoModelForTokenClassification
-import numpy as np
+from transformers import TrainerCallback
 
 class PlotPredictionsCallback(TrainerCallback):
-    def __init__(self, tokenizer, validation_dataset):
-        self.tokenizer = tokenizer
-        self.validation_dataset = validation_dataset
+    def __init__(self, plot_interval=500):
+        self.plot_interval = plot_interval
 
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        """ This method is called during evaluation after every evaluation phase. """
-        # Get model predictions on validation set
-        predictions, label_ids, metrics = kwargs['trainer'].predict(self.validation_dataset)
+    def on_evaluate(self, args, state, control, logs=None, **kwargs):
+        if logs is not None:
+            # Print overall metrics
+            if 'eval_precision' in logs:
+                print(f"Precision: {logs['eval_precision']:.4f}")
+            if 'eval_recall' in logs:
+                print(f"Recall: {logs['eval_recall']:.4f}")
+            if 'eval_f1' in logs:
+                print(f"F1 Score: {logs['eval_f1']:.4f}")
+            
+            # Print per-category metrics (if available)
+            if 'per_category' in logs:
+                print("Per-category Metrics:")
+                for category, metrics in logs['per_category'].items():
+                    print(f"  {category}:")
+                    print(f"    Precision: {metrics['precision']:.4f}")
+                    print(f"    Recall: {metrics['recall']:.4f}")
+                    print(f"    F1 Score: {metrics['f1']:.4f}")
+            
+            # Plot metrics every few evaluations
+            if state.global_step % self.plot_interval == 0:
+                self.plot_metrics(state.global_step)
+
+    def update_plot(self, step):
+        # Update plot data
+        self.train_losses.append(step)  # Placeholder, adjust according to actual losses
+        self.val_losses.append(step)    # Placeholder, adjust according to actual losses
         
-        # Convert predictions and labels into tokens and labels
-        predictions = torch.argmax(torch.tensor(predictions), dim=-1)
+        # Clear previous plots
+        for ax in self.axs.flat:
+            ax.clear()
 
-        decoded_predictions = []
-        decoded_labels = []
+        # Plot Losses
+        self.axs[0, 0].plot(self.train_losses, label="Training Loss")
+        self.axs[0, 0].plot(self.val_losses, label="Validation Loss")
+        self.axs[0, 0].set_xlabel("Steps")
+        self.axs[0, 0].set_ylabel("Loss")
+        self.axs[0, 0].set_title("Loss Over Time")
+        self.axs[0, 0].legend()
 
-        for i, (input_ids, label_ids) in enumerate(zip(predictions, label_ids)):
-            tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
-            label_tokens = self.tokenizer.convert_ids_to_tokens(label_ids)
+        # Plot Precision, Recall, F1 Score
+        self.axs[0, 1].plot(self.precisions, label="Precision")
+        self.axs[0, 1].plot(self.recalls, label="Recall")
+        self.axs[0, 1].plot(self.f1_scores, label="F1 Score")
+        self.axs[0, 1].set_xlabel("Steps")
+        self.axs[0, 1].set_ylabel("Score")
+        self.axs[0, 1].set_title("Precision, Recall, F1 Score")
+        self.axs[0, 1].legend()
 
-            # Filter out special tokens like [CLS], [SEP], etc.
-            tokens = [token for token in tokens if token not in self.tokenizer.all_special_tokens]
-            label_tokens = [label for label in label_tokens if label not in self.tokenizer.all_special_tokens]
-
-            decoded_predictions.append(tokens)
-            decoded_labels.append(label_tokens)
-
-        # Plot predictions for the first few samples
-        self.plot_predictions(decoded_predictions[:3], decoded_labels[:3])
-
-        # Calculate and print classification report
-        report = classification_report(np.concatenate(label_ids), np.concatenate(predictions), output_dict=True)
-        print("Classification report:", report)
-
-    def plot_predictions(self, predictions, labels):
-        """ Helper method to plot predictions against labels """
-        for i, (text, pred, true) in enumerate(zip(predictions, labels)):
-            plt.figure(figsize=(10, 5))
-            plt.title(f"Sample {i + 1}")
-            for t, p, l in zip(text, pred, true):
-                color = 'green' if p == l else 'red'
-                plt.text(0.5, 0.5, f'{t}: {l} -> {p}', color=color)
-            plt.show()
+        self.fig.tight_layout()
+        plt.draw()
+        plt.pause(0.1)  # Allow the plot to refresh and be resizable
