@@ -18,6 +18,7 @@ checkpoint/
 pytorch_model.bin
 *.ckpt
 runs/
+results/
 
 # Hugging Face datasets and cache
 .cache/
@@ -33,7 +34,6 @@ datasets/
 
 # Tokenizer and config files
 *.json
-*.txt
 tokenizer_config.json
 vocab.txt
 
