@@ -5,6 +5,7 @@ from pywinauto import Application, Desktop
 from pynput import keyboard
 from keyboard import is_pressed
 import time
+import pyperclip
 
 from find_window import FindWindow
 
@@ -25,23 +26,26 @@ def get_foreground_window_app():
 
     return app_name
 
-def ListenToUserInput():
-    user_input = ""
+def send_redacted_input():
+    # Find the window that ChatGPT is open in 
+    app = Application(backend='uia').connect(title="ChatGPT")
+    main_window = app.window(title="ChatGPT")
+    if main_window.exists():
+        # Grab the text that's in the window by simulating a copy and paste
+        main_window.type_keys("^a^c")  
+        copied_text = pyperclip.paste()
+        print(f"Copied text: {copied_text}")
+
+        # Redact the text from our LLM 
+        main_window.type_keys("^a{BACKSPACE}REDACTED")
+
+def handle_chatgpt_input():
+
     def on_press(key):
-        nonlocal user_input
         try:
-            if key == keyboard.Key.enter:
-                # Get the final message and see if it's safe
-                print(f"user input: {user_input}")
-                user_input = ""
-                return False
-            elif key == keyboard.Key.space:
-                user_input += " "
-            elif hasattr(key, 'char') and key.char is not None:
-                user_input += key.char
-            elif key == keyboard.Key.backspace:
-                # Handle backspace and remove the last character
-                user_input = user_input[:-1]
+            if key == keyboard.Key.down:
+                # Grab the message and send the redacted version
+                send_redacted_input()
             else:
                 pass
         except AttributeError:
@@ -50,13 +54,6 @@ def ListenToUserInput():
     print("Ready to capture input. Start typing and press Enter when done.")
     with keyboard.Listener(on_press=on_press) as listener:
         listener.join()
-
-def handle_chatgpt_input():
-
-    # Find the text input window in ChatGPT
-    fw = FindWindow("ChatGPT")
-    fw.find_window_by_name()
-    #ListenToUserInput()
 
 def main():
     print("Tracking active application... Press Ctrl+C to stop.")
