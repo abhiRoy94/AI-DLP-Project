@@ -3,14 +3,14 @@ import win32process
 import psutil
 from pywinauto import Application, Desktop
 from pynput import keyboard
-from keyboard import is_pressed
+import keyboard as kb
 import time
 import pyperclip
 
-from find_window import FindWindow
+# Track if 'enter' key is blocked
+blocked_keys = set()
 
 def get_foreground_window_app():
-    """Get the name of the app in the foreground window."""
     # Get the handle of the foreground window
     hwnd = win32gui.GetForegroundWindow()
     
@@ -30,6 +30,7 @@ def send_redacted_input():
     # Find the window that ChatGPT is open in 
     app = Application(backend='uia').connect(title="ChatGPT")
     main_window = app.window(title="ChatGPT")
+
     if main_window.exists():
         # Grab the text that's in the window by simulating a copy and paste
         main_window.type_keys("^a^c")  
@@ -38,32 +39,51 @@ def send_redacted_input():
 
         # Redact the text from our LLM 
         main_window.type_keys("^a{BACKSPACE}REDACTED")
+    else:
+        print("Could not find ChatGPT window.")
 
-def handle_chatgpt_input():
-
-    def on_press(key):
+def on_press(key):
         try:
-            if key == keyboard.Key.down:
+            if key == keyboard.Key.enter:
                 # Grab the message and send the redacted version
                 send_redacted_input()
+                return False
             else:
                 pass
         except AttributeError:
             pass
 
-    print("Ready to capture input. Start typing and press Enter when done.")
-    with keyboard.Listener(on_press=on_press) as listener:
-        listener.join()
+def block_key_with_tracking(key):
+    # Block the key and add it to the blocked_keys set
+    kb.block_key(key)
+    blocked_keys.add(key)
+
+def unblock_key_with_tracking(key):
+    if key in blocked_keys:
+        # Unblock the key and remove it from the blocked_keys set
+        kb.unblock_key(key)
+        blocked_keys.remove(key)
 
 def main():
     print("Tracking active application... Press Ctrl+C to stop.")
+    listener = None
     try:
         while True:
             # Grab the current window and check if it's ChatGPT
             active_app = get_foreground_window_app()
             if active_app and "ChatGPT" in active_app:
-                print("ChatGPT is active! Taking action...")
-                handle_chatgpt_input()
+                # Block the 'enter' key if we're dealing with a ChatGPT window
+                if 'enter' not in blocked_keys:  
+                    block_key_with_tracking('enter')
+                if listener is None or not listener.running:
+                    listener = keyboard.Listener(on_press=on_press)
+                    listener.start()  
+            else:
+                # Keep the 'enter' key useable if we're not on a chatGPT window
+                if 'enter' in blocked_keys: 
+                    unblock_key_with_tracking('enter')
+                if listener is not None and listener.running:
+                    listener.stop()  
 
             # Check every second
             time.sleep(1)  
