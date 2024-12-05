@@ -175,6 +175,7 @@ def FineTunePii():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    '''
     training_args = TrainingArguments(
         output_dir='./results/my_pii_model',            # Directory to save the model checkpoints
         evaluation_strategy="epoch",                    # Evaluate every 'eval_steps' epochs
@@ -202,6 +203,33 @@ def FineTunePii():
         hub_model_id="AyyRoy/my-pii-model",             # Specify your model repo name
         hub_strategy="every_save",                      # Push to the hub every time the model is saved
     )
+    '''
+
+    training_args = TrainingArguments(
+        output_dir="./results/my_pii_model",  # Output directory for model checkpoints and logs
+        evaluation_strategy="steps",
+        eval_steps=5000,
+        save_strategy="steps",
+        save_steps=5000,
+        logging_dir="./logs",  # Directory for logs
+        logging_steps=500,  # Log every 500 steps
+        per_device_train_batch_size=1,  # Batch size per device during training
+        per_device_eval_batch_size=1,  # Batch size for evaluation
+        gradient_accumulation_steps=4,  # Simulate a larger batch size by accumulating gradients
+        num_train_epochs=3,  # Number of epochs
+        learning_rate=3e-5,  # Initial learning rate
+        warmup_steps=500,  # Warmup steps for learning rate scheduler
+        weight_decay=0.01,  # Weight decay
+        fp16=True,  # Enable mixed precision training for faster computations
+        save_total_limit=2,  # Limit the number of checkpoints saved
+        push_to_hub=True,  # Automatically upload the model to the Hugging Face Hub
+        hub_model_id="AyyRoy/my-pii-model",  # Replace with your model's name on the Hugging Face Hub
+        load_best_model_at_end=True,  # Load the best model at the end of training
+        metric_for_best_model="eval_loss",  # Metric to select the best model
+        greater_is_better=False,  # Minimize the evaluation metric
+    )
+
+    model.gradient_checkpointing_enable()
 
     # Optional: Setup callbacks to measure metrics during training phase
     #plot_losses_callback = PlotLossesCallback()
